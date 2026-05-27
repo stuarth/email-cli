@@ -835,6 +835,24 @@ fn thread_components(
         }
     }
 
+    let mut by_thread_hint = HashMap::<String, Vec<usize>>::new();
+    for (idx, message) in messages.iter().enumerate() {
+        if let Some(root) = message
+            .thread
+            .root_message_id
+            .as_ref()
+            .or(message.thread.parent_message_id.as_ref())
+        {
+            by_thread_hint.entry(root.clone()).or_default().push(idx);
+        }
+    }
+    for indexes in by_thread_hint.values() {
+        for window in indexes.windows(2) {
+            graph[window[0]].insert(window[1]);
+            graph[window[1]].insert(window[0]);
+        }
+    }
+
     if subject_fallback {
         let mut by_subject = HashMap::<String, Vec<usize>>::new();
         for (idx, message) in messages.iter().enumerate() {
@@ -1471,6 +1489,38 @@ Second.
                 .threads
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn groups_replies_with_shared_missing_root_reference() {
+        let first = br#"Message-ID: <first-reply@example.com>
+References: <missing-root@example.com>
+Date: Wed, 27 May 2026 10:00:00 +0000
+From: Alice <alice@example.com>
+To: Bob <bob@example.com>
+Subject: Re: Shared root
+Content-Type: text/plain; charset=utf-8
+
+First reply.
+"#;
+        let second = br#"Message-ID: <second-reply@example.com>
+References: <missing-root@example.com>
+Date: Wed, 27 May 2026 11:00:00 +0000
+From: Bob <bob@example.com>
+To: Alice <alice@example.com>
+Subject: Re: Shared root
+Content-Type: text/plain; charset=utf-8
+
+Second reply.
+"#;
+        let first = parse_message_bytes("first.eml", first, RenderOptions::default()).unwrap();
+        let second = parse_message_bytes("second.eml", second, RenderOptions::default()).unwrap();
+        let envelope = build_thread_envelope(vec![first, second], false);
+        assert_eq!(envelope.threads.len(), 1);
+        assert_eq!(
+            envelope.threads[0].missing_parent_message_ids,
+            ["missing-root@example.com"]
         );
     }
 
