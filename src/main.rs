@@ -1,20 +1,25 @@
-use std::{io::Write, path::PathBuf};
+use std::{
+    io::{IsTerminal, Write},
+    path::PathBuf,
+};
 
-use anyhow::Result;
-use clap::{Parser, Subcommand, ValueEnum};
+use anyhow::{Result, anyhow};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use email_cli::{
-    QuoteMode, RenderOptions, build_thread_envelope, extract_part_bytes, parse_message_bytes,
-    read_file_or_stdin, read_required_file, render_message_text, render_thread_text,
+    DiagnosticDto, MessageDto, QuoteMode, RenderOptions, SCHEMA_VERSION, build_messages_envelope,
+    build_thread_envelope, extract_part_bytes, parse_message_bytes, read_file_or_stdin,
+    read_required_file, render_message_text, render_thread_text,
 };
 
 #[derive(Debug, Parser)]
 #[command(name = "email-cli")]
 #[command(about = "Make .eml files legible to LLM agents and shell pipelines")]
+#[command(args_conflicts_with_subcommands = true)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
 
-    /// Message file to parse. Use '-' or omit the argument to read stdin.
+    /// Message file to parse. Use '-' for stdin, or omit when stdin is piped.
     file: Option<String>,
 
     /// Output format for a single message.
@@ -119,6 +124,13 @@ impl From<QuoteChoice> for QuoteMode {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    if should_print_help_for_no_args(&cli, std::io::stdin().is_terminal()) {
+        let mut command = Cli::command();
+        command.print_help()?;
+        println!();
+        return Ok(());
+    }
+
     match cli.command {
         None => run_single(cli),
         Some(Command::Thread {
@@ -181,18 +193,10 @@ fn run_thread(
         max_body_bytes,
         quotes: quotes.into(),
     };
-    let mut messages = Vec::new();
+    let (messages, diagnostics) = parse_files_lossy(files, options);
 
-    for file in files {
-        let raw = read_required_file(&file)?;
-        messages.push(parse_message_bytes(
-            file.display().to_string(),
-            &raw,
-            options,
-        )?);
-    }
-
-    let envelope = build_thread_envelope(messages, subject_fallback);
+    let mut envelope = build_thread_envelope(messages, subject_fallback);
+    envelope.diagnostics.extend(diagnostics);
     match format {
         SingleFormat::Json => {
             println!("{}", serde_json::to_string_pretty(&envelope)?);
@@ -200,6 +204,10 @@ fn run_thread(
         SingleFormat::Text => {
             println!("{}", render_thread_text(&envelope, options.quotes));
         }
+    }
+
+    if envelope.threads.is_empty() && !envelope.diagnostics.is_empty() {
+        return Err(anyhow!("all input files failed"));
     }
 
     Ok(())
@@ -217,26 +225,40 @@ fn run_messages(
         max_body_bytes,
         quotes: quotes.into(),
     };
-    let mut messages = Vec::new();
-
-    for file in files {
-        let raw = read_required_file(&file)?;
-        messages.push(parse_message_bytes(
-            file.display().to_string(),
-            &raw,
-            options,
-        )?);
-    }
+    let (messages, diagnostics) = parse_files_lossy(files, options);
+    let envelope = build_messages_envelope(messages, diagnostics);
+    let all_inputs_failed = envelope.messages.is_empty() && !envelope.diagnostics.is_empty();
 
     match format {
         MessagesFormat::Json => {
-            println!("{}", serde_json::to_string_pretty(&messages)?);
+            println!("{}", serde_json::to_string_pretty(&envelope)?);
         }
         MessagesFormat::Ndjson => {
-            for message in messages {
-                println!("{}", serde_json::to_string(&message)?);
+            for message in envelope.messages {
+                println!(
+                    "{}",
+                    serde_json::to_string(&serde_json::json!({
+                        "schema_version": SCHEMA_VERSION,
+                        "record_type": "message",
+                        "message": message,
+                    }))?
+                );
+            }
+            for diagnostic in envelope.diagnostics {
+                println!(
+                    "{}",
+                    serde_json::to_string(&serde_json::json!({
+                        "schema_version": SCHEMA_VERSION,
+                        "record_type": "diagnostic",
+                        "diagnostics": [diagnostic],
+                    }))?
+                );
             }
         }
+    }
+
+    if all_inputs_failed {
+        return Err(anyhow!("all input files failed"));
     }
 
     Ok(())
@@ -254,4 +276,60 @@ fn run_extract(file: PathBuf, part: &str, output: Option<PathBuf>) -> Result<()>
         }
     }
     Ok(())
+}
+
+fn parse_files_lossy(
+    files: Vec<PathBuf>,
+    options: RenderOptions,
+) -> (Vec<MessageDto>, Vec<DiagnosticDto>) {
+    let mut messages = Vec::new();
+    let mut diagnostics = Vec::new();
+
+    for file in files {
+        let location = file.display().to_string();
+        match read_required_file(&file) {
+            Ok(raw) => match parse_message_bytes(location.clone(), &raw, options) {
+                Ok(message) => messages.push(message),
+                Err(err) => diagnostics.push(DiagnosticDto::error(
+                    "PARSE_FAILED",
+                    format!("Failed to parse {location}: {err:#}"),
+                    None,
+                    Some(&location),
+                )),
+            },
+            Err(err) => diagnostics.push(DiagnosticDto::error(
+                "READ_FAILED",
+                format!("Failed to read {location}: {err:#}"),
+                None,
+                Some(&location),
+            )),
+        }
+    }
+
+    diagnostics.sort_by(|a, b| a.location.cmp(&b.location).then(a.code.cmp(&b.code)));
+    (messages, diagnostics)
+}
+
+fn should_print_help_for_no_args(cli: &Cli, stdin_is_terminal: bool) -> bool {
+    cli.command.is_none() && cli.file.is_none() && stdin_is_terminal
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_args_prints_help_only_for_interactive_stdin() {
+        let cli = Cli::parse_from(["email-cli"]);
+
+        assert!(should_print_help_for_no_args(&cli, true));
+        assert!(!should_print_help_for_no_args(&cli, false));
+    }
+
+    #[test]
+    fn explicit_stdin_arg_does_not_print_help() {
+        let cli = Cli::parse_from(["email-cli", "-"]);
+
+        assert!(!should_print_help_for_no_args(&cli, true));
+    }
 }

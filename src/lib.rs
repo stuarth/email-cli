@@ -5,7 +5,8 @@ use std::{
 
 use anyhow::{Context, Result, anyhow};
 use mail_parser::{
-    Address, ContentType, HeaderName, HeaderValue, Message, MessageParser, MessagePart, MimeHeaders,
+    Address, ContentType, DateTime, HeaderName, HeaderValue, Message, MessageParser, MessagePart,
+    MimeHeaders,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -55,6 +56,8 @@ pub struct MessageFieldsDto {
     pub node_id: String,
     pub message_id: Option<String>,
     pub date: Option<String>,
+    #[serde(skip_serializing)]
+    pub date_timestamp: Option<i64>,
     pub date_original: Option<String>,
     pub subject: Option<String>,
     pub from: Vec<AddressDto>,
@@ -80,8 +83,22 @@ pub struct BodyDto {
     pub text: String,
     pub html: Option<String>,
     pub html_included: bool,
+    pub html_available: bool,
+    pub text_source: String,
+    pub alternatives: Vec<BodyAlternativeDto>,
     pub fragments: Vec<BodyFragmentDto>,
     pub truncation: TruncationDto,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct BodyAlternativeDto {
+    pub part_id: String,
+    pub kind: String,
+    pub text: Option<String>,
+    pub html: Option<String>,
+    pub decoded_size_bytes: usize,
+    pub decoded_sha256: String,
+    pub truncated: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -140,7 +157,7 @@ pub struct DiagnosticDto {
 }
 
 impl DiagnosticDto {
-    fn info(code: &str, message: impl Into<String>, json_path: Option<&str>) -> Self {
+    pub fn info(code: &str, message: impl Into<String>, json_path: Option<&str>) -> Self {
         Self {
             code: code.to_string(),
             severity: "info".to_string(),
@@ -150,7 +167,7 @@ impl DiagnosticDto {
         }
     }
 
-    fn warning(
+    pub fn warning(
         code: &str,
         message: impl Into<String>,
         json_path: Option<&str>,
@@ -159,6 +176,21 @@ impl DiagnosticDto {
         Self {
             code: code.to_string(),
             severity: "warning".to_string(),
+            message: message.into(),
+            json_path: json_path.map(str::to_string),
+            location: location.map(str::to_string),
+        }
+    }
+
+    pub fn error(
+        code: &str,
+        message: impl Into<String>,
+        json_path: Option<&str>,
+        location: Option<&str>,
+    ) -> Self {
+        Self {
+            code: code.to_string(),
+            severity: "error".to_string(),
             message: message.into(),
             json_path: json_path.map(str::to_string),
             location: location.map(str::to_string),
@@ -176,6 +208,13 @@ pub struct MessageDto {
     pub headers: Vec<HeaderDto>,
     pub parts: Vec<PartDto>,
     pub nested_messages: Vec<NestedMessageDto>,
+    pub diagnostics: Vec<DiagnosticDto>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct MessagesEnvelopeDto {
+    pub schema_version: String,
+    pub messages: Vec<MessageDto>,
     pub diagnostics: Vec<DiagnosticDto>,
 }
 
@@ -262,6 +301,7 @@ pub fn build_thread_envelope(
     subject_fallback: bool,
 ) -> ThreadEnvelopeDto {
     messages.sort_by_key(message_sort_key);
+    ensure_unique_node_ids(&mut messages);
 
     let sources = messages
         .iter()
@@ -305,6 +345,19 @@ pub fn build_thread_envelope(
     }
 }
 
+pub fn build_messages_envelope(
+    mut messages: Vec<MessageDto>,
+    diagnostics: Vec<DiagnosticDto>,
+) -> MessagesEnvelopeDto {
+    ensure_unique_node_ids(&mut messages);
+
+    MessagesEnvelopeDto {
+        schema_version: SCHEMA_VERSION.to_string(),
+        messages,
+        diagnostics,
+    }
+}
+
 pub fn render_message_text(message: &MessageDto, quote_mode: QuoteMode) -> String {
     let mut out = String::new();
     let subject = message.message.subject.as_deref().unwrap_or("(no subject)");
@@ -324,9 +377,10 @@ pub fn render_message_text(message: &MessageDto, quote_mode: QuoteMode) -> Strin
     out.push('\n');
     out.push_str(&render_body_text(&message.body, quote_mode));
 
-    if !message.parts.is_empty() {
+    let visible_parts = visible_text_parts(&message.parts);
+    if !visible_parts.is_empty() {
         out.push_str("\n\nAttachments and parts:\n");
-        for part in &message.parts {
+        for part in visible_parts {
             out.push_str(&format!(
                 "- {} {} {} {} {} bytes sha256:{}\n",
                 part.part_id,
@@ -364,14 +418,16 @@ pub fn render_thread_text(envelope: &ThreadEnvelopeDto, quote_mode: QuoteMode) -
             out.push_str(&format!("[{}] {} {}\n", node.node_id, date, from));
             out.push_str(&render_body_text(&message.body, quote_mode));
 
-            if !message.parts.is_empty() {
+            let visible_parts = visible_text_parts(&message.parts);
+            if !visible_parts.is_empty() {
                 out.push_str("\n\nAttachments and parts:\n");
-                for part in &message.parts {
+                for part in visible_parts {
                     out.push_str(&format!(
-                        "- {} {} {} {} bytes sha256:{}\n",
+                        "- {} {} {} {} {} bytes sha256:{}\n",
                         part.part_id,
                         part.filename.as_deref().unwrap_or("(unnamed)"),
                         part.content_type,
+                        part.kind,
                         part.decoded_size_bytes,
                         part.decoded_sha256
                     ));
@@ -383,6 +439,10 @@ pub fn render_thread_text(envelope: &ThreadEnvelopeDto, quote_mode: QuoteMode) -
     }
 
     out.trim_end().to_string()
+}
+
+fn visible_text_parts(parts: &[PartDto]) -> Vec<&PartDto> {
+    parts.iter().filter(|part| part.kind != "body").collect()
 }
 
 pub fn read_file_or_stdin(path: Option<&str>) -> Result<(String, Vec<u8>)> {
@@ -415,7 +475,7 @@ fn build_message_dto(
     let paths = part_paths(message);
     let source_hash = source.sha256.clone();
 
-    let message_id = message.message_id().map(str::to_string);
+    let message_id = message.message_id().and_then(normalize_message_id);
     let references = ids_from_header(message.references());
     let in_reply_to = ids_from_header(message.in_reply_to()).into_iter().next();
     let parent_message_id = in_reply_to.clone().or_else(|| references.last().cloned());
@@ -427,7 +487,7 @@ fn build_message_dto(
         .or_else(|| subject.clone());
     let node_seed = message_id
         .as_ref()
-        .map(|message_id| format!("{message_id}:{}:{}", source.path, source.sha256))
+        .map(|message_id| format!("{message_id}:{}", source.sha256))
         .unwrap_or_else(|| source_hash.clone());
     let node_id = format!("msg_{}", short_sha256(node_seed.as_bytes()));
     let is_reply = parent_message_id.is_some()
@@ -435,7 +495,9 @@ fn build_message_dto(
             .as_deref()
             .is_some_and(|subject| subject.trim_start().to_ascii_lowercase().starts_with("re:"));
 
-    let date = message.date().map(|date| date.to_rfc3339());
+    let parsed_date = message.date();
+    let date = parsed_date.map(|date| DateTime::from_timestamp(date.to_timestamp()).to_rfc3339());
+    let date_timestamp = parsed_date.map(|date| date.to_timestamp());
     let date_original = message
         .header_raw(HeaderName::Date)
         .map(|raw| raw_header_value(raw, "Date"));
@@ -448,12 +510,35 @@ fn build_message_dto(
         .body_text(0)
         .map(|text| text.into_owned())
         .unwrap_or_default();
+    let text_source = text_part_idx
+        .and_then(|idx| message.parts.get(idx))
+        .map(|part| {
+            if part.is_text_html() {
+                "html"
+            } else if part.is_text() {
+                "text"
+            } else {
+                "none"
+            }
+        })
+        .unwrap_or("none")
+        .to_string();
+    let html_available =
+        message.html_body_count() > 0 || message.parts.iter().any(|part| part.is_text_html());
+    if text_source == "html" && !options.include_html {
+        diagnostics.push(DiagnosticDto::info(
+            "HTML_CONVERTED_TO_TEXT",
+            "HTML body content was converted to text; pass --html to include raw HTML.",
+            Some("$.body"),
+        ));
+    }
     let (text, fragments, truncation) = build_body_text(
         &full_text,
         &text_part_id,
         options.max_body_bytes,
         &mut diagnostics,
     );
+    let alternatives = build_body_alternatives(message, &paths, options);
     let html = if options.include_html {
         message.body_html(0).map(|html| html.into_owned())
     } else {
@@ -507,7 +592,7 @@ fn build_message_dto(
         if let Some(nested) = part.message() {
             nested_messages.push(NestedMessageDto {
                 part_id: part_id.clone(),
-                message_id: nested.message_id().map(str::to_string),
+                message_id: nested.message_id().and_then(normalize_message_id),
                 subject: nested.subject().map(str::to_string),
             });
         }
@@ -522,6 +607,7 @@ fn build_message_dto(
             node_id,
             message_id,
             date,
+            date_timestamp,
             date_original,
             subject,
             from: address_list(message.from()),
@@ -543,6 +629,9 @@ fn build_message_dto(
             text,
             html,
             html_included: options.include_html,
+            html_available,
+            text_source,
+            alternatives,
             fragments,
             truncation,
         },
@@ -621,6 +710,101 @@ fn content_type_name(content_type: &ContentType<'_>) -> String {
         Some(subtype) => format!("{}/{}", content_type.c_type, subtype),
         None => content_type.c_type.to_string(),
     }
+}
+
+fn build_body_alternatives(
+    message: &Message<'_>,
+    paths: &[String],
+    options: RenderOptions,
+) -> Vec<BodyAlternativeDto> {
+    let mut alternatives = Vec::new();
+
+    for (pos, part_idx) in message.text_body.iter().copied().enumerate() {
+        let Some(part) = message.parts.get(part_idx as usize) else {
+            continue;
+        };
+        let Some(text) = message.body_text(pos).map(|text| text.into_owned()) else {
+            continue;
+        };
+        let part_id = paths
+            .get(part_idx as usize)
+            .cloned()
+            .unwrap_or_else(|| (part_idx + 1).to_string());
+        let kind = if part.is_text_html() {
+            "html_text"
+        } else {
+            "text"
+        };
+        alternatives.push(body_alternative(
+            part_id,
+            kind,
+            Some(text),
+            None,
+            options.max_body_bytes,
+            options.include_html,
+        ));
+    }
+
+    for (pos, part_idx) in message.html_body.iter().copied().enumerate() {
+        let Some(html) = message.body_html(pos).map(|html| html.into_owned()) else {
+            continue;
+        };
+        let part_id = paths
+            .get(part_idx as usize)
+            .cloned()
+            .unwrap_or_else(|| (part_idx + 1).to_string());
+        alternatives.push(body_alternative(
+            part_id,
+            "html",
+            None,
+            Some(html),
+            options.max_body_bytes,
+            options.include_html,
+        ));
+    }
+
+    alternatives
+}
+
+fn body_alternative(
+    part_id: String,
+    kind: &str,
+    text: Option<String>,
+    html: Option<String>,
+    max_body_bytes: usize,
+    include_html: bool,
+) -> BodyAlternativeDto {
+    let content = text.as_deref().or(html.as_deref()).unwrap_or_default();
+    let decoded_size_bytes = content.len();
+    let decoded_sha256 = sha256_hex(content.as_bytes());
+    let (text, text_truncated) = text
+        .map(|text| truncate_to_max_body_bytes(&text, max_body_bytes))
+        .map(|(text, truncated)| (Some(text), truncated))
+        .unwrap_or((None, false));
+    let (html, html_truncated) = html
+        .filter(|_| include_html)
+        .map(|html| truncate_to_max_body_bytes(&html, max_body_bytes))
+        .map(|(html, truncated)| (Some(html), truncated))
+        .unwrap_or((None, false));
+
+    BodyAlternativeDto {
+        part_id,
+        kind: kind.to_string(),
+        text,
+        html,
+        decoded_size_bytes,
+        decoded_sha256,
+        truncated: text_truncated || html_truncated,
+    }
+}
+
+fn truncate_to_max_body_bytes(value: &str, max_body_bytes: usize) -> (String, bool) {
+    if value.len() <= max_body_bytes {
+        return (value.to_string(), false);
+    }
+
+    let end = utf8_boundary_at_or_before(value, max_body_bytes);
+    (value[..end].to_string(), true)
 }
 
 fn build_body_text(
@@ -754,15 +938,19 @@ fn lines_with_offsets(text: &str) -> Vec<(usize, &str)> {
         lines.push((start, segment));
         start += segment.len();
     }
-    if start < text.len() {
-        lines.push((start, &text[start..]));
-    }
     lines
 }
 
 fn quote_depth(line: &str) -> usize {
-    let trimmed = line.trim_start();
-    trimmed.chars().take_while(|ch| *ch == '>').count()
+    let mut depth = 0usize;
+    let mut chars = line.trim_start().chars().peekable();
+
+    while chars.next_if_eq(&'>').is_some() {
+        depth += 1;
+        while chars.next_if_eq(&' ').is_some() {}
+    }
+
+    depth
 }
 
 fn is_reply_attribution(line: &str) -> bool {
@@ -859,11 +1047,13 @@ fn thread_components(
             if !linked_message_indexes(message, id_to_indexes).is_empty() {
                 continue;
             }
-            if let Some(subject) = &message.thread.base_subject {
-                by_subject
-                    .entry(subject.to_ascii_lowercase())
-                    .or_default()
-                    .push(idx);
+            if let Some(subject) = message
+                .thread
+                .base_subject
+                .as_deref()
+                .and_then(subject_fallback_key)
+            {
+                by_subject.entry(subject).or_default().push(idx);
             }
         }
         for indexes in by_subject.values() {
@@ -910,11 +1100,12 @@ fn linked_message_indexes(
     message: &MessageDto,
     id_to_indexes: &HashMap<String, Vec<usize>>,
 ) -> BTreeSet<usize> {
+    let parent_candidates = parent_candidate_ids(message);
     message
         .thread
         .references
         .iter()
-        .chain(message.thread.parent_message_id.iter())
+        .chain(parent_candidates.iter())
         .filter_map(|id| id_to_indexes.get(id))
         .flatten()
         .copied()
@@ -947,24 +1138,28 @@ fn build_thread(
 
     for idx in &component {
         let message = all_messages[*idx].clone();
-        let parent_node_id = message
-            .thread
-            .parent_message_id
-            .as_ref()
-            .and_then(|parent_id| {
-                let parent_supplied_in_this_thread = id_to_indexes
-                    .get(parent_id)
-                    .is_some_and(|indexes| indexes.iter().any(|idx| component_set.contains(idx)));
-                match id_to_node.get(parent_id) {
-                    Some(node_id) => Some(node_id.clone()),
-                    None => {
-                        if !parent_supplied_in_this_thread {
-                            missing_parent_message_ids.insert(parent_id.clone());
-                        }
-                        None
-                    }
-                }
-            });
+        let parent_candidates = parent_candidate_ids(&message);
+        let mut first_missing_parent = None;
+        let mut parent_node_id = None;
+
+        for parent_id in &parent_candidates {
+            let parent_supplied_in_this_thread = id_to_indexes
+                .get(parent_id)
+                .is_some_and(|indexes| indexes.iter().any(|idx| component_set.contains(idx)));
+            if let Some(node_id) = id_to_node.get(parent_id) {
+                parent_node_id = Some(node_id.clone());
+                break;
+            }
+            if !parent_supplied_in_this_thread && first_missing_parent.is_none() {
+                first_missing_parent = Some(parent_id.clone());
+            }
+        }
+
+        if parent_node_id.is_none()
+            && let Some(parent_id) = first_missing_parent
+        {
+            missing_parent_message_ids.insert(parent_id);
+        }
 
         if let Some(parent_node_id) = &parent_node_id {
             child_map
@@ -973,8 +1168,11 @@ fn build_thread(
                 .push(message.message.node_id.clone());
         }
 
+        let has_unresolved_parent = parent_node_id.is_none() && !parent_candidates.is_empty();
         let link_confidence = if parent_node_id.is_some() {
             "id"
+        } else if has_unresolved_parent {
+            "orphan"
         } else if subject_link_node_indexes.contains(idx) {
             "subject"
         } else {
@@ -1032,14 +1230,8 @@ fn build_thread(
         .find_map(|node| node.message.thread.base_subject.clone());
     let participants = collect_participants(&nodes);
     let time_range = TimeRangeDto {
-        start: nodes
-            .iter()
-            .filter_map(|n| n.message.message.date.clone())
-            .min(),
-        end: nodes
-            .iter()
-            .filter_map(|n| n.message.message.date.clone())
-            .max(),
+        start: thread_date_bound(&nodes, DateBound::Start),
+        end: thread_date_bound(&nodes, DateBound::End),
     };
     let duplicate_message_ids = nodes
         .iter()
@@ -1092,11 +1284,13 @@ fn subject_link_node_indexes(
         if !linked_message_indexes(&messages[*idx], id_to_indexes).is_empty() {
             continue;
         }
-        if let Some(subject) = &messages[*idx].thread.base_subject {
-            by_subject
-                .entry(subject.to_ascii_lowercase())
-                .or_default()
-                .push(*idx);
+        if let Some(subject) = messages[*idx]
+            .thread
+            .base_subject
+            .as_deref()
+            .and_then(subject_fallback_key)
+        {
+            by_subject.entry(subject).or_default().push(*idx);
         }
     }
 
@@ -1107,18 +1301,31 @@ fn subject_link_node_indexes(
         .collect()
 }
 
-fn thread_node_sort_key(node: &ThreadNodeDto) -> (usize, String, String, String) {
+fn subject_fallback_key(subject: &str) -> Option<String> {
+    let subject = subject.trim();
+    if subject.is_empty() {
+        return None;
+    }
+
+    Some(subject.to_ascii_lowercase())
+}
+
+fn thread_node_sort_key(node: &ThreadNodeDto) -> (usize, bool, i64, String, String) {
     let base = message_sort_key(&node.message);
-    (node.depth, base.0, base.1, base.2)
+    (node.depth, base.0, base.1, base.2, base.3)
 }
 
 fn thread_id_for_nodes(nodes: &[ThreadNodeDto]) -> String {
     let seed = nodes
         .iter()
         .map(|node| {
-            node.message_id
-                .as_deref()
-                .unwrap_or(node.message.source.sha256.as_str())
+            format!(
+                "{}:{}",
+                node.node_id,
+                node.message_id
+                    .as_deref()
+                    .unwrap_or(node.message.source.sha256.as_str())
+            )
         })
         .collect::<Vec<_>>()
         .join("\n");
@@ -1171,12 +1378,73 @@ fn collect_participants(nodes: &[ThreadNodeDto]) -> Vec<AddressDto> {
     participants
 }
 
-fn message_sort_key(message: &MessageDto) -> (String, String, String) {
+fn ensure_unique_node_ids(messages: &mut [MessageDto]) {
+    let mut seen = HashMap::<String, usize>::new();
+    for message in messages {
+        let original = message.message.node_id.clone();
+        let count = seen.entry(original.clone()).or_insert(0);
+        *count += 1;
+        if *count > 1 {
+            message.message.node_id = format!("{original}_{}", *count);
+        }
+    }
+}
+
+fn parent_candidate_ids(message: &MessageDto) -> Vec<String> {
+    let mut candidates = Vec::new();
+    if let Some(parent_id) = &message.message.in_reply_to {
+        candidates.push(parent_id.clone());
+    }
+    if let Some(reference_parent) = message.message.references.last()
+        && !candidates
+            .iter()
+            .any(|candidate| candidate == reference_parent)
+    {
+        candidates.push(reference_parent.clone());
+    }
+    candidates
+}
+
+#[derive(Clone, Copy)]
+enum DateBound {
+    Start,
+    End,
+}
+
+fn thread_date_bound(nodes: &[ThreadNodeDto], bound: DateBound) -> Option<String> {
+    let mut dates = nodes
+        .iter()
+        .filter_map(|node| {
+            Some((
+                date_sort_tuple(&node.message),
+                node.message.message.date.as_ref()?.clone(),
+            ))
+        })
+        .collect::<Vec<_>>();
+
+    match bound {
+        DateBound::Start => dates.sort_by_key(|(key, _)| *key),
+        DateBound::End => dates.sort_by_key(|(key, _)| std::cmp::Reverse(*key)),
+    }
+
+    dates.into_iter().map(|(_, date)| date).next()
+}
+
+fn message_sort_key(message: &MessageDto) -> (bool, i64, String, String) {
+    let (missing_date, timestamp) = date_sort_tuple(message);
     (
-        message.message.date.clone().unwrap_or_default(),
+        missing_date,
+        timestamp,
         message.source.path.clone(),
         message.source.sha256.clone(),
     )
+}
+
+fn date_sort_tuple(message: &MessageDto) -> (bool, i64) {
+    match message.message.date_timestamp {
+        Some(timestamp) => (false, timestamp),
+        None => (true, 0),
+    }
 }
 
 fn part_paths(message: &Message<'_>) -> Vec<String> {
@@ -1232,10 +1500,24 @@ fn address_list(address: Option<&Address<'_>>) -> Vec<AddressDto> {
 
 fn ids_from_header(header: &HeaderValue<'_>) -> Vec<String> {
     match header {
-        HeaderValue::Text(text) => vec![text.to_string()],
-        HeaderValue::TextList(list) => list.iter().map(|text| text.to_string()).collect(),
+        HeaderValue::Text(text) => normalize_message_id(text).into_iter().collect(),
+        HeaderValue::TextList(list) => list
+            .iter()
+            .filter_map(|text| normalize_message_id(text))
+            .collect(),
         _ => Vec::new(),
     }
+}
+
+fn normalize_message_id(value: &str) -> Option<String> {
+    let value = value.trim();
+    let value = value
+        .strip_prefix('<')
+        .and_then(|value| value.strip_suffix('>'))
+        .unwrap_or(value)
+        .trim();
+
+    (!value.is_empty()).then(|| value.to_string())
 }
 
 fn header_value_to_string(value: &HeaderValue<'_>) -> String {
@@ -1344,6 +1626,13 @@ On Tue, Bob wrote:
     }
 
     #[test]
+    fn text_rendering_does_not_list_body_parts_as_attachments() {
+        let dto = parse_message_bytes("simple.eml", SIMPLE, RenderOptions::default()).unwrap();
+        let text = render_message_text(&dto, QuoteMode::Keep);
+        assert!(!text.contains("Attachments and parts:"));
+    }
+
+    #[test]
     fn builds_thread_timeline() {
         let reply = br#"Message-ID: <reply@example.com>
 In-Reply-To: <root@example.com>
@@ -1393,9 +1682,23 @@ Reply text.
     fn duplicate_message_ids_have_unique_node_ids() {
         let first = parse_message_bytes("first.eml", SIMPLE, RenderOptions::default()).unwrap();
         let second = parse_message_bytes("second.eml", SIMPLE, RenderOptions::default()).unwrap();
-        assert_ne!(first.message.node_id, second.message.node_id);
+        assert_eq!(first.message.node_id, second.message.node_id);
 
         let envelope = build_thread_envelope(vec![first, second], false);
+        let node_ids = envelope
+            .threads
+            .iter()
+            .flat_map(|thread| thread.nodes.iter().map(|node| node.node_id.clone()))
+            .collect::<Vec<_>>();
+        let unique_node_ids = node_ids.iter().collect::<BTreeSet<_>>();
+        assert_eq!(node_ids.len(), unique_node_ids.len());
+        let thread_ids = envelope
+            .threads
+            .iter()
+            .map(|thread| thread.thread_id.clone())
+            .collect::<Vec<_>>();
+        let unique_thread_ids = thread_ids.iter().collect::<BTreeSet<_>>();
+        assert_eq!(thread_ids.len(), unique_thread_ids.len());
         assert!(
             envelope
                 .diagnostics
@@ -1408,6 +1711,81 @@ Reply text.
                 .iter()
                 .any(|thread| thread.duplicate_message_ids == ["root@example.com"])
         );
+    }
+
+    #[test]
+    fn timezone_offsets_are_sorted_by_instant() {
+        let later_local = br#"Message-ID: <later-local@example.com>
+Date: Wed, 27 May 2026 09:30:00 -0700
+From: Alice <alice@example.com>
+To: Bob <bob@example.com>
+Subject: Same subject
+Content-Type: text/plain; charset=utf-8
+
+Later by UTC.
+"#;
+        let earlier_utc = br#"Message-ID: <earlier-utc@example.com>
+Date: Wed, 27 May 2026 10:00:00 +0000
+From: Bob <bob@example.com>
+To: Alice <alice@example.com>
+Subject: Re: Same subject
+Content-Type: text/plain; charset=utf-8
+
+Earlier by UTC.
+"#;
+        let later =
+            parse_message_bytes("later.eml", later_local, RenderOptions::default()).unwrap();
+        let earlier =
+            parse_message_bytes("earlier.eml", earlier_utc, RenderOptions::default()).unwrap();
+        let envelope = build_thread_envelope(vec![later, earlier], true);
+        assert_eq!(envelope.threads.len(), 1);
+        assert_eq!(
+            envelope.threads[0].nodes[0]
+                .message
+                .message
+                .message_id
+                .as_deref(),
+            Some("earlier-utc@example.com")
+        );
+        assert_eq!(
+            envelope.threads[0].time_range.start.as_deref(),
+            Some("2026-05-27T10:00:00Z")
+        );
+        assert_eq!(
+            envelope.threads[0].time_range.end.as_deref(),
+            Some("2026-05-27T16:30:00Z")
+        );
+    }
+
+    #[test]
+    fn falls_back_to_references_when_in_reply_to_is_unresolved() {
+        let reply = br#"Message-ID: <reply@example.com>
+In-Reply-To: <missing@example.com>
+References: <root@example.com>
+Date: Wed, 27 May 2026 11:00:00 +0000
+From: Bob <bob@example.com>
+To: Alice <alice@example.com>
+Subject: Re: Project update
+Content-Type: text/plain; charset=utf-8
+
+Reply text.
+"#;
+        let root = parse_message_bytes("root.eml", SIMPLE, RenderOptions::default()).unwrap();
+        let reply = parse_message_bytes("reply.eml", reply, RenderOptions::default()).unwrap();
+        let envelope = build_thread_envelope(vec![reply, root], false);
+        let thread = &envelope.threads[0];
+        let root_node = thread
+            .nodes
+            .iter()
+            .find(|node| node.message_id.as_deref() == Some("root@example.com"))
+            .unwrap();
+        let reply_node = thread
+            .nodes
+            .iter()
+            .find(|node| node.message_id.as_deref() == Some("reply@example.com"))
+            .unwrap();
+        assert_eq!(reply_node.parent_node_id.as_ref(), Some(&root_node.node_id));
+        assert!(thread.missing_parent_message_ids.is_empty());
     }
 
     #[test]
@@ -1493,6 +1871,34 @@ Second.
     }
 
     #[test]
+    fn subject_fallback_ignores_empty_subjects() {
+        let first = br#"Message-ID: <first-empty-subject@example.com>
+Date: Wed, 27 May 2026 10:00:00 +0000
+From: Alice <alice@example.com>
+To: Bob <bob@example.com>
+Content-Type: text/plain; charset=utf-8
+
+First.
+"#;
+        let second = br#"Message-ID: <second-empty-subject@example.com>
+Date: Wed, 27 May 2026 11:00:00 +0000
+From: Bob <bob@example.com>
+To: Alice <alice@example.com>
+Content-Type: text/plain; charset=utf-8
+
+Second.
+"#;
+        let first = parse_message_bytes("first.eml", first, RenderOptions::default()).unwrap();
+        let second = parse_message_bytes("second.eml", second, RenderOptions::default()).unwrap();
+        assert_eq!(
+            build_thread_envelope(vec![first, second], true)
+                .threads
+                .len(),
+            2
+        );
+    }
+
+    #[test]
     fn groups_replies_with_shared_missing_root_reference() {
         let first = br#"Message-ID: <first-reply@example.com>
 References: <missing-root@example.com>
@@ -1522,6 +1928,12 @@ Second reply.
             envelope.threads[0].missing_parent_message_ids,
             ["missing-root@example.com"]
         );
+        assert!(
+            envelope.threads[0]
+                .nodes
+                .iter()
+                .all(|node| node.link_confidence == "orphan")
+        );
     }
 
     #[test]
@@ -1535,6 +1947,55 @@ Second reply.
         assert_eq!(attachment.part_id, "1.2");
         assert_eq!(attachment.filename.as_deref(), Some("note.txt"));
         assert_eq!(extract_part_bytes(ATTACHMENT, "1.2").unwrap(), b"Hello\n");
+    }
+
+    #[test]
+    fn extracts_nested_rfc822_message_bytes() {
+        let raw = b"Message-ID: <outer@example.com>\r\nDate: Wed, 27 May 2026 10:00:00 +0000\r\nFrom: Alice <alice@example.com>\r\nTo: Bob <bob@example.com>\r\nSubject: Forwarded message\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"b\"\r\n\r\n--b\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nForwarded below.\r\n--b\r\nContent-Type: message/rfc822\r\nContent-Disposition: attachment; filename=\"forwarded.eml\"\r\n\r\nMessage-ID: <nested@example.com>\r\nDate: Wed, 27 May 2026 09:00:00 +0000\r\nFrom: Carol <carol@example.com>\r\nTo: Alice <alice@example.com>\r\nSubject: Nested\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nNested body.\r\n--b--\r\n";
+        let dto = parse_message_bytes("outer.eml", raw, RenderOptions::default()).unwrap();
+        let nested = dto
+            .parts
+            .iter()
+            .find(|part| part.content_type == "message/rfc822")
+            .unwrap();
+        assert_eq!(nested.part_id, "1.2");
+        assert_eq!(nested.kind, "attachment");
+        assert!(nested.extractable);
+        assert!(nested.decoded_size_bytes > 0);
+        let extracted = extract_part_bytes(raw, "1.2").unwrap();
+        assert!(String::from_utf8_lossy(&extracted).contains("Message-ID: <nested@example.com>"));
+        assert_eq!(
+            dto.nested_messages[0].message_id.as_deref(),
+            Some("nested@example.com")
+        );
+    }
+
+    #[test]
+    fn html_only_bodies_report_source_and_alternatives() {
+        let raw = br#"Message-ID: <html-only@example.com>
+Date: Wed, 27 May 2026 10:00:00 +0000
+From: Alice <alice@example.com>
+To: Bob <bob@example.com>
+Subject: HTML only
+Content-Type: text/html; charset=utf-8
+
+<html><body><p>Hello <b>Bob</b></p></body></html>
+"#;
+        let dto = parse_message_bytes("html.eml", raw, RenderOptions::default()).unwrap();
+        assert!(dto.body.html_available);
+        assert_eq!(dto.body.text_source, "html");
+        assert!(dto.body.html.is_none());
+        assert!(
+            dto.body
+                .alternatives
+                .iter()
+                .any(|alternative| alternative.kind == "html")
+        );
+        assert!(
+            dto.diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "HTML_CONVERTED_TO_TEXT")
+        );
     }
 
     #[test]
@@ -1559,5 +2020,26 @@ Second reply.
             let bytes = &dto.body.text.as_bytes()[fragment.byte_range[0]..fragment.byte_range[1]];
             assert_eq!(fragment.sha256, sha256_hex(bytes));
         }
+    }
+
+    #[test]
+    fn quote_depth_counts_spaced_markers() {
+        let dto = parse_message_bytes(
+            "spaced.eml",
+            br#"Message-ID: <spaced@example.com>
+Subject: Spaced
+Content-Type: text/plain; charset=utf-8
+
+> > nested quote
+"#,
+            RenderOptions::default(),
+        )
+        .unwrap();
+        assert!(
+            dto.body
+                .fragments
+                .iter()
+                .any(|fragment| fragment.kind == "quoted" && fragment.quote_depth == 2)
+        );
     }
 }
