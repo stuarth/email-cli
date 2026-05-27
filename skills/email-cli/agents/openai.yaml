@@ -1,0 +1,4 @@
+interface:
+  display_name: "Email CLI"
+  short_description: "Parse .eml files for LLM agents"
+  default_prompt: "Use $email-cli to inspect this .eml file and return agent-friendly JSON or text."
