@@ -898,7 +898,14 @@ fn build_body_text(
     max_body_bytes: usize,
     diagnostics: &mut Vec<DiagnosticDto>,
 ) -> (String, Vec<BodyFragmentDto>, TruncationDto) {
-    let full_fragments = quote_fragments(full_text, part_id);
+    let (full_fragments, tail_quote_detected) = quote_fragments(full_text, part_id);
+    if tail_quote_detected {
+        diagnostics.push(DiagnosticDto::info(
+            "QUOTED_TAIL_DETECTED",
+            "An embedded earlier-message block marks the rest of the body as quoted; use --quotes keep if rendered text must preserve it.",
+            Some("$.body.fragments"),
+        ));
+    }
     let truncated = full_text.len() > max_body_bytes;
     let text_end = if truncated {
         diagnostics.push(DiagnosticDto::info(
@@ -952,9 +959,12 @@ fn build_body_text(
     )
 }
 
-fn quote_fragments(text: &str, part_id: &str) -> Vec<BodyFragmentDto> {
+/// Returns the classified fragments and whether a tail-quote pattern fired.
+/// Tail detection classifies unmarked lines wholesale, so callers surface it
+/// as a diagnostic rather than leaving the reclassification silent.
+fn quote_fragments(text: &str, part_id: &str) -> (Vec<BodyFragmentDto>, bool) {
     if text.is_empty() {
-        return Vec::new();
+        return (Vec::new(), false);
     }
 
     let mut runs = Vec::<(String, usize, usize, usize)>::new();
@@ -999,7 +1009,8 @@ fn quote_fragments(text: &str, part_id: &str) -> Vec<BodyFragmentDto> {
         runs.push((run_kind, run_depth, run_start, run_end));
     }
 
-    runs.into_iter()
+    let fragments = runs
+        .into_iter()
         .map(|(kind, quote_depth, start, end)| {
             let bytes = &text.as_bytes()[start..end];
             BodyFragmentDto {
@@ -1017,7 +1028,9 @@ fn quote_fragments(text: &str, part_id: &str) -> Vec<BodyFragmentDto> {
                 truncated: false,
             }
         })
-        .collect()
+        .collect();
+
+    (fragments, tail_start.is_some())
 }
 
 fn lines_with_offsets(text: &str) -> Vec<(usize, &str)> {
@@ -2208,10 +2221,25 @@ Original message text that carries no quote markers.
         let quoted_text = &dto.body.text[quoted[0].byte_range[0]..quoted[0].byte_range[1]];
         assert!(quoted_text.starts_with("________________________________"));
         assert!(quoted_text.contains("Original message text"));
+        assert!(
+            dto.diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "QUOTED_TAIL_DETECTED")
+        );
 
         let rendered = render_message_text(&dto, QuoteMode::Drop);
         assert!(rendered.contains("Sounds good"));
         assert!(!rendered.contains("Original message text"));
+    }
+
+    #[test]
+    fn marker_only_quoting_gets_no_tail_diagnostic() {
+        let dto = parse_message_bytes("simple.eml", SIMPLE, RenderOptions::default()).unwrap();
+        assert!(
+            dto.diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code != "QUOTED_TAIL_DETECTED")
+        );
     }
 
     #[test]
