@@ -582,16 +582,27 @@ fn build_message_dto(
 
     // The chosen body content is already in body.text / body.html; repeating it
     // in alternatives doubles the payload for consumers that pay per token.
+    // Both branches match by source part rather than content equality, so the
+    // dedup still holds when truncation makes the serialized copies differ.
+    let body_html_part_id = message
+        .html_body
+        .first()
+        .and_then(|idx| paths.get(*idx as usize).cloned());
     for alternative in &mut alternatives {
         if alternative.text.is_some()
-            && alternative.text.as_deref() == Some(text.as_str())
             && Some(alternative.part_id.as_str()) == body_text_part_id.as_deref()
         {
             alternative.text = None;
             alternative.same_as = Some("body.text".to_string());
-        } else if alternative.html.is_some() && alternative.html == html {
+        } else if alternative.html.is_some()
+            && html.is_some()
+            && Some(alternative.part_id.as_str()) == body_html_part_id.as_deref()
+        {
             alternative.html = None;
             alternative.same_as = Some("body.html".to_string());
+            // body.html is emitted untruncated, so the pointed-to content is
+            // complete even when this entry's copy would have been cut.
+            alternative.truncated = false;
         }
     }
 
@@ -2125,6 +2136,28 @@ Content-Type: text/html; charset=utf-8
             .unwrap();
         assert_eq!(text_alternative.same_as.as_deref(), Some("body.text"));
         assert!(text_alternative.text.is_none());
+    }
+
+    #[test]
+    fn html_alternative_dedups_even_when_truncated() {
+        let raw = b"Message-ID: <alt-trunc@example.com>\r\nDate: Wed, 27 May 2026 10:00:00 +0000\r\nFrom: Alice <alice@example.com>\r\nTo: Bob <bob@example.com>\r\nSubject: Alternative\r\nMIME-Version: 1.0\r\nContent-Type: multipart/alternative; boundary=\"b\"\r\n\r\n--b\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nPlain body.\r\n--b\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<p>HTML body that is long enough to be truncated by the byte limit.</p>\r\n--b--\r\n";
+        let options = RenderOptions {
+            include_html: true,
+            max_body_bytes: 24,
+            ..RenderOptions::default()
+        };
+        let dto = parse_message_bytes("alt-trunc.eml", raw, options).unwrap();
+        let body_html = dto.body.html.as_deref().unwrap();
+        assert!(body_html.contains("truncated by the byte limit"));
+        let html_alternative = dto
+            .body
+            .alternatives
+            .iter()
+            .find(|alternative| alternative.kind == "html")
+            .unwrap();
+        assert_eq!(html_alternative.same_as.as_deref(), Some("body.html"));
+        assert!(html_alternative.html.is_none());
+        assert!(!html_alternative.truncated);
     }
 
     #[test]
