@@ -86,8 +86,14 @@ email-cli extract message.eml --part 1.2 -o attachment.bin
   markers like `[quoted content collapsed: 14 lines]`.
 - `--quotes drop`: remove quoted text from rendered text; JSON still preserves
   fragment metadata.
-- Quote detection covers `>` markers, `On … wrote:` attributions,
-  `-----Original Message-----` dividers, and Outlook-style top-post blocks.
+- Quote detection covers `>` markers and `On … wrote:` attributions, plus
+  tail patterns (`-----Original Message-----` dividers, underscore
+  separators, and `From:`/`Sent:` or `Date:`/`Subject:` header blocks) that
+  mark the rest of the body as quoted. A `QUOTED_TAIL_DETECTED` diagnostic
+  records when a tail pattern fired.
+- Prefer `--quotes keep` for forwarded messages (`Fwd:` subjects) — the
+  forwarded payload is classified as a quoted tail, so `collapse`/`drop`
+  would remove it from rendered text.
 - Add `--html` only when raw HTML is needed. Without it, JSON still reports
   `html_available` and body alternative metadata.
 - A `TEXT_BODY_CONTAINS_HTML` diagnostic means the plain-text body embeds raw

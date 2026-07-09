@@ -302,11 +302,13 @@ Quote handling:
   `[quoted content collapsed: 14 lines]`
 - `--quotes drop`: omit quoted runs from text output
 
-Quote detection is mechanical and covers the common plain-text patterns:
-`>`-prefixed lines, `On … wrote:` attributions, `-----Original Message-----`
-dividers, and Outlook-style top-post blocks (an underscore separator or a bare
-`From:`/`Sent:`/`Subject:` header block, after which the rest of the body is
-quoted).
+Quote detection is mechanical: `>`-prefixed lines and `On … wrote:`
+attribution lines, plus three tail patterns after which the rest of the body
+is treated as quoted — an `-----Original Message-----` divider, an underscore
+separator followed by a `From:` line, and a bare `From:` / `Sent:` (or
+`Date:`) / `Subject:` header block. When a tail pattern fires, JSON output
+records a `QUOTED_TAIL_DETECTED` diagnostic; use `--quotes keep` when
+forwarded or inline-reply content below the divider must be preserved.
 
 JSON output always preserves fragment metadata, even when text rendering drops
 or collapses quoted content.
@@ -334,6 +336,7 @@ string-matching prose:
 | `BODY_TRUNCATED` | info | Body text was cut at `--max-body-bytes`; see `body.truncation`. |
 | `HTML_CONVERTED_TO_TEXT` | info | `body.text` was converted from an HTML body; pass `--html` for the raw HTML. |
 | `TEXT_BODY_CONTAINS_HTML` | info | The text/plain body itself embeds raw HTML markup; consider the HTML alternative when `html_available` is true. |
+| `QUOTED_TAIL_DETECTED` | info | A tail pattern (Original Message divider, underscore separator, or embedded header block) marked the rest of the body as quoted; use `--quotes keep` if rendered text must preserve it. |
 | `PART_ENCODING_PROBLEM` | warning | The parser reported an encoding problem for a MIME part; see `location` for the part ID. |
 | `MISSING_THREAD_PARENT` | warning | A referenced parent Message-ID was not among the supplied files. |
 | `DUPLICATE_MESSAGE_ID` | warning | The same Message-ID occurs more than once across the supplied files. |
@@ -357,8 +360,10 @@ batch output, so agents never have to parse stderr.
 
 `schema_version` is `MAJOR.MINOR`, currently `1.1`.
 
-- Minor bumps are additive (new keys) or reduce default content in ways a flag
-  can restore (for example `--headers all`). Existing keys keep their meaning.
+- Minor bumps are additive (new keys), reduce default content in ways a flag
+  can restore (for example `--headers all`), or replace duplicated content
+  with a pointer to where it already lives (for example `same_as`). Existing
+  keys keep their meaning.
 - Major bumps may remove or rename keys or change their meaning.
 - Consumers should ignore keys they do not recognize.
 
