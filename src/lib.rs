@@ -573,6 +573,13 @@ fn build_message_dto(
         &mut diagnostics,
     );
     let body_text_part_id = text_part_idx.and_then(|idx| paths.get(idx).cloned());
+    if text_source == "text" && text_looks_like_html(&text) {
+        diagnostics.push(DiagnosticDto::info(
+            "TEXT_BODY_CONTAINS_HTML",
+            "Plain-text body appears to contain raw HTML markup; consider the HTML alternative when html_available is true.",
+            Some("$.body"),
+        ));
+    }
     let mut alternatives = build_body_alternatives(message, &paths, options);
     let html = if options.include_html {
         message.body_html(0).map(|html| html.into_owned())
@@ -957,10 +964,14 @@ fn quote_fragments(text: &str, part_id: &str) -> Vec<BodyFragmentDto> {
     let mut run_end = 0usize;
     let mut initialized = false;
 
-    for (start, line) in lines_with_offsets(text) {
+    let lines = lines_with_offsets(text);
+    let tail_start = tail_quote_start(&lines);
+    for (idx, (start, line)) in lines.iter().enumerate() {
+        let (start, line) = (*start, *line);
         let end = start + line.len();
+        let in_tail = tail_start.is_some_and(|tail| idx >= tail);
         let depth = quote_depth(line);
-        let quoted = depth > 0 || is_reply_attribution(line);
+        let quoted = in_tail || depth > 0 || is_reply_attribution(line);
         let kind = if quoted { "quoted" } else { "fresh" };
         let depth = if quoted { depth.max(1) } else { 0 };
 
@@ -1041,6 +1052,65 @@ fn is_reply_attribution(line: &str) -> bool {
         || lower.starts_with("from:") && lower.contains("sent:") && lower.contains("subject:")
 }
 
+/// Index of the line where an embedded earlier message starts, if any.
+///
+/// Top-posting clients (Outlook most commonly) append the original message
+/// without `>` markers, so per-line depth detection never sees it. The fixed
+/// patterns here are: an underscore separator followed by a `From:` line, an
+/// `-----Original Message-----` divider, and a bare `From:`/`Sent:`/`Subject:`
+/// header block. Everything from the matched line onward is quoted.
+fn tail_quote_start(lines: &[(usize, &str)]) -> Option<usize> {
+    lines.iter().enumerate().position(|(idx, (_, line))| {
+        let trimmed = line.trim();
+        trimmed.eq_ignore_ascii_case("-----Original Message-----")
+            || (is_underscore_separator(trimmed) && next_line_is_from(lines, idx))
+            || is_embedded_header_block(lines, idx)
+    })
+}
+
+fn is_underscore_separator(trimmed: &str) -> bool {
+    trimmed.len() >= 8 && trimmed.chars().all(|ch| ch == '_')
+}
+
+fn next_line_is_from(lines: &[(usize, &str)], idx: usize) -> bool {
+    lines
+        .iter()
+        .skip(idx + 1)
+        .take(3)
+        .map(|(_, line)| line.trim())
+        .find(|line| !line.is_empty())
+        .is_some_and(|line| starts_with_ignore_case(line, "from:"))
+}
+
+fn is_embedded_header_block(lines: &[(usize, &str)], idx: usize) -> bool {
+    if !starts_with_ignore_case(lines[idx].1.trim(), "from:") {
+        return false;
+    }
+
+    let mut has_sent = false;
+    let mut has_subject = false;
+    for (_, line) in lines.iter().skip(idx + 1).take(5) {
+        let line = line.trim();
+        has_sent |=
+            starts_with_ignore_case(line, "sent:") || starts_with_ignore_case(line, "date:");
+        has_subject |= starts_with_ignore_case(line, "subject:");
+    }
+    has_sent && has_subject
+}
+
+fn starts_with_ignore_case(line: &str, prefix: &str) -> bool {
+    line.get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+}
+
+/// Cheap, deterministic markup check: a closing tag (`</x`) is a strong
+/// signal that a text/plain part embeds raw HTML.
+fn text_looks_like_html(text: &str) -> bool {
+    text.as_bytes()
+        .windows(3)
+        .any(|window| window[0] == b'<' && window[1] == b'/' && window[2].is_ascii_alphabetic())
+}
+
 fn utf8_boundary_at_or_before(text: &str, max: usize) -> usize {
     if max >= text.len() {
         return text.len();
@@ -1069,9 +1139,14 @@ fn render_body_text(body: &BodyDto, quote_mode: QuoteMode) -> String {
             let mut out = String::new();
             for fragment in &body.fragments {
                 if fragment.kind == "quoted" {
+                    let lines = body
+                        .text
+                        .get(fragment.byte_range[0]..fragment.byte_range[1])
+                        .map(|text| text.lines().count())
+                        .unwrap_or_default();
                     out.push_str(&format!(
-                        "\n[quoted content collapsed: {} bytes]\n",
-                        fragment.byte_range[1].saturating_sub(fragment.byte_range[0])
+                        "\n[quoted content collapsed: {lines} line{}]\n",
+                        if lines == 1 { "" } else { "s" }
                     ));
                 } else if let Some(text) = body
                     .text
@@ -2098,6 +2173,132 @@ Content-Type: text/html; charset=utf-8
             let bytes = &dto.body.text.as_bytes()[fragment.byte_range[0]..fragment.byte_range[1]];
             assert_eq!(fragment.sha256, sha256_hex(bytes));
         }
+    }
+
+    const OUTLOOK_REPLY: &[u8] = br#"Message-ID: <outlook@example.com>
+Date: Wed, 27 May 2026 10:00:00 +0000
+From: Bob <bob@example.com>
+To: Alice <alice@example.com>
+Subject: Re: Project update
+Content-Type: text/plain; charset=utf-8
+
+Sounds good, see answers below.
+
+________________________________
+From: Alice <alice@example.com>
+Sent: Wednesday, 27 May 2026 09:00:00
+To: Bob <bob@example.com>
+Subject: Project update
+
+Original message text that carries no quote markers.
+"#;
+
+    #[test]
+    fn outlook_separator_marks_tail_as_quoted() {
+        let dto =
+            parse_message_bytes("outlook.eml", OUTLOOK_REPLY, RenderOptions::default()).unwrap();
+        let quoted = dto
+            .body
+            .fragments
+            .iter()
+            .filter(|fragment| fragment.kind == "quoted")
+            .collect::<Vec<_>>();
+        assert_eq!(quoted.len(), 1);
+        assert_eq!(quoted[0].byte_range[1], dto.body.text.len());
+        let quoted_text = &dto.body.text[quoted[0].byte_range[0]..quoted[0].byte_range[1]];
+        assert!(quoted_text.starts_with("________________________________"));
+        assert!(quoted_text.contains("Original message text"));
+
+        let rendered = render_message_text(&dto, QuoteMode::Drop);
+        assert!(rendered.contains("Sounds good"));
+        assert!(!rendered.contains("Original message text"));
+    }
+
+    #[test]
+    fn original_message_divider_marks_tail_as_quoted() {
+        let raw = br#"Message-ID: <divider@example.com>
+Date: Wed, 27 May 2026 10:00:00 +0000
+From: Bob <bob@example.com>
+To: Alice <alice@example.com>
+Subject: RE: Project update
+Content-Type: text/plain; charset=utf-8
+
+Agreed.
+
+-----Original Message-----
+From: Alice <alice@example.com>
+
+Earlier text without markers.
+"#;
+        let dto = parse_message_bytes("divider.eml", raw, RenderOptions::default()).unwrap();
+        let rendered = render_message_text(&dto, QuoteMode::Drop);
+        assert!(rendered.contains("Agreed."));
+        assert!(!rendered.contains("Earlier text without markers."));
+    }
+
+    #[test]
+    fn embedded_header_block_marks_tail_as_quoted() {
+        let raw = br#"Message-ID: <block@example.com>
+Date: Wed, 27 May 2026 10:00:00 +0000
+From: Bob <bob@example.com>
+To: Alice <alice@example.com>
+Subject: RE: Project update
+Content-Type: text/plain; charset=utf-8
+
+Works for me.
+
+From: Alice <alice@example.com>
+Sent: Wednesday, 27 May 2026 09:00:00
+To: Bob <bob@example.com>
+Subject: Project update
+
+Earlier text without markers.
+"#;
+        let dto = parse_message_bytes("block.eml", raw, RenderOptions::default()).unwrap();
+        let rendered = render_message_text(&dto, QuoteMode::Drop);
+        assert!(rendered.contains("Works for me."));
+        assert!(!rendered.contains("Earlier text without markers."));
+    }
+
+    #[test]
+    fn collapse_marker_counts_lines() {
+        let dto = parse_message_bytes("simple.eml", SIMPLE, RenderOptions::default()).unwrap();
+        let rendered = render_message_text(&dto, QuoteMode::Collapse);
+        assert!(rendered.contains("[quoted content collapsed: 2 lines]"));
+    }
+
+    #[test]
+    fn text_body_with_markup_gets_diagnostic() {
+        let raw = br#"Message-ID: <markup@example.com>
+Date: Wed, 27 May 2026 10:00:00 +0000
+From: Alice <alice@example.com>
+To: Bob <bob@example.com>
+Subject: Markup
+Content-Type: text/plain; charset=utf-8
+
+Hi Bob,
+
+<p style="font-family: Arial;">Rate us!</p><a href="https://example.com">link</a>
+"#;
+        let dto = parse_message_bytes("markup.eml", raw, RenderOptions::default()).unwrap();
+        assert!(
+            dto.diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "TEXT_BODY_CONTAINS_HTML")
+        );
+    }
+
+    #[test]
+    fn clean_text_body_gets_no_markup_diagnostic() {
+        let dto = parse_message_bytes("simple.eml", SIMPLE, RenderOptions::default()).unwrap();
+        assert!(
+            dto.diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code != "TEXT_BODY_CONTAINS_HTML")
+        );
+        // Math with angle brackets is not markup.
+        assert!(!text_looks_like_html("a<b and c>d hold, even a </ alone"));
+        assert!(text_looks_like_html("closing </p> tag"));
     }
 
     #[test]
