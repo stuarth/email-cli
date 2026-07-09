@@ -135,10 +135,113 @@ Message IDs are normalized without surrounding angle brackets. Dates are
 normalized to UTC RFC3339 in `message.date`, while the original Date header is
 kept in `message.date_original`.
 
-## Threads By Default, When You Ask For Conversations
+A complete single-message output, for a multipart message with a text+HTML
+body and a PDF attachment (hashes and repeated entries trimmed for brevity):
+
+```json
+{
+  "schema_version": "1.1",
+  "source": {
+    "path": "message.eml",
+    "size_bytes": 1104,
+    "sha256": "d5f9ba56cc…"
+  },
+  "message": {
+    "node_id": "msg_3bd5876c4adc0c4d",
+    "message_id": "root-123@example.com",
+    "date": "2026-05-27T10:00:00Z",
+    "date_original": "Wed, 27 May 2026 03:00:00 -0700",
+    "subject": "Q3 plan — draft",
+    "from": [{ "name": "Alice Example", "email": "alice@example.com" }],
+    "to": [{ "name": "Bob Example", "email": "bob@example.com" }],
+    "cc": [],
+    "bcc": [],
+    "reply_to": [],
+    "in_reply_to": null,
+    "references": []
+  },
+  "thread": {
+    "parent_message_id": null,
+    "root_message_id": null,
+    "references": [],
+    "base_subject": "Q3 plan — draft",
+    "is_reply": false
+  },
+  "body": {
+    "text": "Hi Bob,\n\nAttached is the Q3 draft. …",
+    "html": null,
+    "html_included": false,
+    "html_available": true,
+    "text_source": "text",
+    "text_part_id": "1.1.1",
+    "alternatives": [
+      {
+        "part_id": "1.1.1",
+        "kind": "text",
+        "text": null,
+        "html": null,
+        "same_as": "body.text",
+        "decoded_size_bytes": 101,
+        "decoded_sha256": "faccab8fa6…",
+        "truncated": false
+      },
+      {
+        "part_id": "1.1.2",
+        "kind": "html",
+        "text": null,
+        "html": null,
+        "same_as": null,
+        "decoded_size_bytes": 158,
+        "decoded_sha256": "aad511a4a5…",
+        "truncated": false
+      }
+    ],
+    "fragments": [
+      {
+        "id": "frag_67d37117136f2bca",
+        "kind": "fresh",
+        "quote_depth": 0,
+        "part_id": "1.1.1",
+        "byte_range": [0, 101],
+        "sha256": "faccab8fa6…",
+        "truncated": false
+      }
+    ],
+    "truncation": {
+      "max_body_bytes": 65536,
+      "truncated": false,
+      "omitted_fragment_ids": []
+    }
+  },
+  "headers": [
+    { "name": "From", "value": "Alice Example <alice@example.com>", "raw": " Alice Example <alice@example.com>\n" },
+    { "name": "Subject", "value": "Q3 plan — draft", "raw": " =?utf-8?q?Q3_plan_=E2=80=94_draft?=\n" }
+  ],
+  "headers_omitted": 0,
+  "parts": [
+    {
+      "part_id": "1.2",
+      "kind": "attachment",
+      "content_type": "application/pdf",
+      "filename": "q3-plan.pdf",
+      "safe_filename": "q3-plan.pdf",
+      "disposition": "attachment",
+      "content_id": null,
+      "decoded_size_bytes": 150,
+      "decoded_sha256": "a8d52b9e7c…",
+      "extractable": true
+    }
+  ],
+  "nested_messages": [],
+  "diagnostics": []
+}
+```
+
+## Reconstructing Threads
 
 Email is usually read as a conversation, not isolated records. `email-cli thread`
-reconstructs threads across the `.eml` files you supply:
+reconstructs threads across the `.eml` files you supply — threading is always
+explicit, never inferred from the filesystem:
 
 ```sh
 email-cli thread inbox/*.eml | jq '.threads[].timeline'
@@ -195,8 +298,15 @@ email-cli thread *.eml --format text --quotes drop
 Quote handling:
 
 - `--quotes keep`: preserve quoted content
-- `--quotes collapse`: replace quoted runs with deterministic markers
+- `--quotes collapse`: replace quoted runs with deterministic markers such as
+  `[quoted content collapsed: 14 lines]`
 - `--quotes drop`: omit quoted runs from text output
+
+Quote detection is mechanical and covers the common plain-text patterns:
+`>`-prefixed lines, `On … wrote:` attributions, `-----Original Message-----`
+dividers, and Outlook-style top-post blocks (an underscore separator or a bare
+`From:`/`Sent:`/`Subject:` header block, after which the rest of the body is
+quoted).
 
 JSON output always preserves fragment metadata, even when text rendering drops
 or collapses quoted content.
@@ -213,6 +323,55 @@ email-cli messages *.eml --format ndjson
 Batch commands keep going after per-file read or parse failures and include
 structured diagnostics in the output. If every supplied input fails,
 `email-cli` exits nonzero.
+
+## Diagnostics
+
+Diagnostics carry stable codes so agents can branch on them without
+string-matching prose:
+
+| Code | Severity | Meaning |
+| --- | --- | --- |
+| `BODY_TRUNCATED` | info | Body text was cut at `--max-body-bytes`; see `body.truncation`. |
+| `HTML_CONVERTED_TO_TEXT` | info | `body.text` was converted from an HTML body; pass `--html` for the raw HTML. |
+| `TEXT_BODY_CONTAINS_HTML` | info | The text/plain body itself embeds raw HTML markup; consider the HTML alternative when `html_available` is true. |
+| `PART_ENCODING_PROBLEM` | warning | The parser reported an encoding problem for a MIME part; see `location` for the part ID. |
+| `MISSING_THREAD_PARENT` | warning | A referenced parent Message-ID was not among the supplied files. |
+| `DUPLICATE_MESSAGE_ID` | warning | The same Message-ID occurs more than once across the supplied files. |
+| `READ_FAILED` | error | An input file could not be read. |
+| `PARSE_FAILED` | error | An input could not be parsed as an RFC 822 / RFC 5322 message. |
+
+When the single-message command fails to read or parse its input under the
+default JSON format, it prints a schema-versioned envelope containing one of
+the error diagnostics above to stdout and exits nonzero — the same contract as
+batch output, so agents never have to parse stderr.
+
+## Exit Codes
+
+- `0`: success, including batch runs where some inputs failed (check
+  `diagnostics`)
+- `1`: the single input could not be read or parsed, `extract` failed, or every
+  batch input failed
+- `2`: command-line usage error
+
+## Schema Stability
+
+`schema_version` is `MAJOR.MINOR`, currently `1.1`.
+
+- Minor bumps are additive (new keys) or reduce default content in ways a flag
+  can restore (for example `--headers all`). Existing keys keep their meaning.
+- Major bumps may remove or rename keys or change their meaning.
+- Consumers should ignore keys they do not recognize.
+
+Every documented key is always present: repeated fields are empty arrays and
+absent scalars are `null`, so `jq` paths never disappear between messages.
+
+## Agent Skill
+
+`skills/email-cli/` ships a skill that teaches coding agents when to reach for
+`email-cli` instead of hand-rolling MIME parsing, plus jq patterns and safety
+guidance for attachments. For Claude Code, copy or symlink it into
+`~/.claude/skills/` (or a project's `.claude/skills/`); for OpenAI Codex, the
+bundled `agents/openai.yaml` config points at the same skill.
 
 ## Design Principles
 
