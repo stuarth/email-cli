@@ -146,7 +146,17 @@ impl From<HeaderChoice> for HeaderScope {
     }
 }
 
-fn main() -> Result<()> {
+fn main() {
+    if let Err(err) = run() {
+        // Print the context chain only. anyhow's Debug formatting appends a
+        // stack backtrace whenever RUST_BACKTRACE is set, which buries the
+        // message for both humans and agents.
+        eprintln!("Error: {err:#}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<()> {
     let cli = Cli::parse();
 
     if should_print_help_for_no_args(&cli, std::io::stdin().is_terminal()) {
@@ -188,14 +198,24 @@ fn main() -> Result<()> {
 }
 
 fn run_single(cli: Cli) -> Result<()> {
-    let (path, raw) = read_file_or_stdin(cli.file.as_deref())?;
+    let emit_json_errors = matches!(cli.format, SingleFormat::Json);
+    let (path, raw) = match read_file_or_stdin(cli.file.as_deref()) {
+        Ok(input) => input,
+        Err(err) => {
+            let location = cli.file.as_deref().unwrap_or("-");
+            return fail_single(emit_json_errors, "READ_FAILED", location, err);
+        }
+    };
     let options = RenderOptions {
         include_html: cli.html,
         max_body_bytes: cli.max_body_bytes,
         quotes: cli.quotes.into(),
         headers: cli.headers.into(),
     };
-    let message = parse_message_bytes(path, &raw, options)?;
+    let message = match parse_message_bytes(path.clone(), &raw, options) {
+        Ok(message) => message,
+        Err(err) => return fail_single(emit_json_errors, "PARSE_FAILED", &path, err),
+    };
 
     match cli.format {
         SingleFormat::Json => {
@@ -207,6 +227,25 @@ fn run_single(cli: Cli) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Single-message failures still exit nonzero, but JSON consumers get the
+/// same schema-versioned diagnostics envelope batch commands emit instead of
+/// having to parse stderr prose.
+fn fail_single(emit_json: bool, code: &str, location: &str, err: anyhow::Error) -> Result<()> {
+    if emit_json {
+        let envelope = serde_json::json!({
+            "schema_version": SCHEMA_VERSION,
+            "diagnostics": [DiagnosticDto::error(
+                code,
+                format!("{err:#}"),
+                None,
+                Some(location),
+            )],
+        });
+        println!("{}", serde_json::to_string_pretty(&envelope)?);
+    }
+    Err(err)
 }
 
 fn run_thread(

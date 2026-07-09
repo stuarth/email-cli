@@ -132,6 +132,61 @@ fn messages_ndjson_uses_record_discriminators() {
 }
 
 #[test]
+fn single_message_parse_failure_emits_json_diagnostics() {
+    let output = Command::cargo_bin("email-cli")
+        .unwrap()
+        .env("RUST_BACKTRACE", "1")
+        .write_stdin("this is not an email\n")
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["schema_version"], "1.1");
+    assert_eq!(json["diagnostics"][0]["code"], "PARSE_FAILED");
+    assert_eq!(json["diagnostics"][0]["severity"], "error");
+    assert_eq!(json["diagnostics"][0]["location"], "-");
+
+    let stderr = String::from_utf8(output.stderr.clone()).unwrap();
+    assert!(stderr.contains("Error:"));
+    assert!(!stderr.contains("Stack backtrace"));
+}
+
+#[test]
+fn single_message_read_failure_emits_json_diagnostics() {
+    let output = Command::cargo_bin("email-cli")
+        .unwrap()
+        .arg("/nonexistent/message.eml")
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["diagnostics"][0]["code"], "READ_FAILED");
+    assert_eq!(
+        json["diagnostics"][0]["location"],
+        "/nonexistent/message.eml"
+    );
+}
+
+#[test]
+fn single_message_text_failure_keeps_stdout_empty() {
+    let output = Command::cargo_bin("email-cli")
+        .unwrap()
+        .arg("--format")
+        .arg("text")
+        .write_stdin("this is not an email\n")
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+
+    assert!(output.stdout.is_empty());
+}
+
+#[test]
 fn messages_exits_nonzero_when_every_input_fails() {
     let dir = tempdir().unwrap();
     let bad = write_message(&dir, "bad.eml", b"");
