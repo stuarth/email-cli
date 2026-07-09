@@ -11,8 +11,30 @@ use mail_parser::{
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-pub const SCHEMA_VERSION: &str = "1.0";
+pub const SCHEMA_VERSION: &str = "1.1";
 pub const DEFAULT_MAX_BODY_BYTES: usize = 65_536;
+
+/// Headers included in JSON output by default. Everything else (transport,
+/// authentication, and vendor headers) is metadata agents rarely read and is
+/// available with `--headers all`.
+const STANDARD_HEADERS: &[&str] = &[
+    "from",
+    "sender",
+    "reply-to",
+    "to",
+    "cc",
+    "bcc",
+    "subject",
+    "date",
+    "message-id",
+    "in-reply-to",
+    "references",
+    "mime-version",
+    "content-type",
+    "list-id",
+    "list-unsubscribe",
+    "auto-submitted",
+];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum QuoteMode {
@@ -21,11 +43,19 @@ pub enum QuoteMode {
     Drop,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum HeaderScope {
+    #[default]
+    Standard,
+    All,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct RenderOptions {
     pub include_html: bool,
     pub max_body_bytes: usize,
     pub quotes: QuoteMode,
+    pub headers: HeaderScope,
 }
 
 impl Default for RenderOptions {
@@ -34,6 +64,7 @@ impl Default for RenderOptions {
             include_html: false,
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             quotes: QuoteMode::Keep,
+            headers: HeaderScope::Standard,
         }
     }
 }
@@ -85,6 +116,7 @@ pub struct BodyDto {
     pub html_included: bool,
     pub html_available: bool,
     pub text_source: String,
+    pub text_part_id: Option<String>,
     pub alternatives: Vec<BodyAlternativeDto>,
     pub fragments: Vec<BodyFragmentDto>,
     pub truncation: TruncationDto,
@@ -96,6 +128,7 @@ pub struct BodyAlternativeDto {
     pub kind: String,
     pub text: Option<String>,
     pub html: Option<String>,
+    pub same_as: Option<String>,
     pub decoded_size_bytes: usize,
     pub decoded_sha256: String,
     pub truncated: bool,
@@ -206,6 +239,7 @@ pub struct MessageDto {
     pub thread: ThreadHintDto,
     pub body: BodyDto,
     pub headers: Vec<HeaderDto>,
+    pub headers_omitted: usize,
     pub parts: Vec<PartDto>,
     pub nested_messages: Vec<NestedMessageDto>,
     pub diagnostics: Vec<DiagnosticDto>,
@@ -538,14 +572,41 @@ fn build_message_dto(
         options.max_body_bytes,
         &mut diagnostics,
     );
-    let alternatives = build_body_alternatives(message, &paths, options);
+    let body_text_part_id = text_part_idx.and_then(|idx| paths.get(idx).cloned());
+    let mut alternatives = build_body_alternatives(message, &paths, options);
     let html = if options.include_html {
         message.body_html(0).map(|html| html.into_owned())
     } else {
         None
     };
 
-    let headers = message
+    // The chosen body content is already in body.text / body.html; repeating it
+    // in alternatives doubles the payload for consumers that pay per token.
+    // Both branches match by source part rather than content equality, so the
+    // dedup still holds when truncation makes the serialized copies differ.
+    let body_html_part_id = message
+        .html_body
+        .first()
+        .and_then(|idx| paths.get(*idx as usize).cloned());
+    for alternative in &mut alternatives {
+        if alternative.text.is_some()
+            && Some(alternative.part_id.as_str()) == body_text_part_id.as_deref()
+        {
+            alternative.text = None;
+            alternative.same_as = Some("body.text".to_string());
+        } else if alternative.html.is_some()
+            && html.is_some()
+            && Some(alternative.part_id.as_str()) == body_html_part_id.as_deref()
+        {
+            alternative.html = None;
+            alternative.same_as = Some("body.html".to_string());
+            // body.html is emitted untruncated, so the pointed-to content is
+            // complete even when this entry's copy would have been cut.
+            alternative.truncated = false;
+        }
+    }
+
+    let all_headers = message
         .headers()
         .iter()
         .map(|header| {
@@ -562,6 +623,20 @@ fn build_message_dto(
             }
         })
         .collect::<Vec<_>>();
+    let (headers, headers_omitted) = match options.headers {
+        HeaderScope::All => (all_headers, 0),
+        HeaderScope::Standard => {
+            let total = all_headers.len();
+            let kept = all_headers
+                .into_iter()
+                .filter(|header| {
+                    STANDARD_HEADERS.contains(&header.name.to_ascii_lowercase().as_str())
+                })
+                .collect::<Vec<_>>();
+            let omitted = total - kept.len();
+            (kept, omitted)
+        }
+    };
 
     let attachment_indexes = message
         .attachments
@@ -631,11 +706,13 @@ fn build_message_dto(
             html_included: options.include_html,
             html_available,
             text_source,
+            text_part_id: body_text_part_id,
             alternatives,
             fragments,
             truncation,
         },
         headers,
+        headers_omitted,
         parts,
         nested_messages,
         diagnostics,
@@ -792,6 +869,7 @@ fn body_alternative(
         kind: kind.to_string(),
         text,
         html,
+        same_as: None,
         decoded_size_bytes,
         decoded_sha256,
         truncated: text_truncated || html_truncated,
@@ -2020,6 +2098,108 @@ Content-Type: text/html; charset=utf-8
             let bytes = &dto.body.text.as_bytes()[fragment.byte_range[0]..fragment.byte_range[1]];
             assert_eq!(fragment.sha256, sha256_hex(bytes));
         }
+    }
+
+    #[test]
+    fn body_source_alternative_is_deduplicated() {
+        let dto = parse_message_bytes("simple.eml", SIMPLE, RenderOptions::default()).unwrap();
+        let alternative = &dto.body.alternatives[0];
+        assert_eq!(alternative.same_as.as_deref(), Some("body.text"));
+        assert!(alternative.text.is_none());
+        assert!(alternative.decoded_size_bytes > 0);
+        assert!(!alternative.decoded_sha256.is_empty());
+        assert_eq!(dto.body.text_part_id.as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn html_alternative_dedups_against_body_html() {
+        let raw = b"Message-ID: <alt@example.com>\r\nDate: Wed, 27 May 2026 10:00:00 +0000\r\nFrom: Alice <alice@example.com>\r\nTo: Bob <bob@example.com>\r\nSubject: Alternative\r\nMIME-Version: 1.0\r\nContent-Type: multipart/alternative; boundary=\"b\"\r\n\r\n--b\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nPlain body.\r\n--b\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<p>HTML body.</p>\r\n--b--\r\n";
+        let options = RenderOptions {
+            include_html: true,
+            ..RenderOptions::default()
+        };
+        let dto = parse_message_bytes("alt.eml", raw, options).unwrap();
+        assert!(dto.body.html.is_some());
+        let html_alternative = dto
+            .body
+            .alternatives
+            .iter()
+            .find(|alternative| alternative.kind == "html")
+            .unwrap();
+        assert_eq!(html_alternative.same_as.as_deref(), Some("body.html"));
+        assert!(html_alternative.html.is_none());
+        let text_alternative = dto
+            .body
+            .alternatives
+            .iter()
+            .find(|alternative| alternative.kind == "text")
+            .unwrap();
+        assert_eq!(text_alternative.same_as.as_deref(), Some("body.text"));
+        assert!(text_alternative.text.is_none());
+    }
+
+    #[test]
+    fn html_alternative_dedups_even_when_truncated() {
+        let raw = b"Message-ID: <alt-trunc@example.com>\r\nDate: Wed, 27 May 2026 10:00:00 +0000\r\nFrom: Alice <alice@example.com>\r\nTo: Bob <bob@example.com>\r\nSubject: Alternative\r\nMIME-Version: 1.0\r\nContent-Type: multipart/alternative; boundary=\"b\"\r\n\r\n--b\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nPlain body.\r\n--b\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<p>HTML body that is long enough to be truncated by the byte limit.</p>\r\n--b--\r\n";
+        let options = RenderOptions {
+            include_html: true,
+            max_body_bytes: 24,
+            ..RenderOptions::default()
+        };
+        let dto = parse_message_bytes("alt-trunc.eml", raw, options).unwrap();
+        let body_html = dto.body.html.as_deref().unwrap();
+        assert!(body_html.contains("truncated by the byte limit"));
+        let html_alternative = dto
+            .body
+            .alternatives
+            .iter()
+            .find(|alternative| alternative.kind == "html")
+            .unwrap();
+        assert_eq!(html_alternative.same_as.as_deref(), Some("body.html"));
+        assert!(html_alternative.html.is_none());
+        assert!(!html_alternative.truncated);
+    }
+
+    #[test]
+    fn standard_headers_omit_transport_noise() {
+        let raw =
+            br#"Received: from mail.example.com by mx.example.com; Wed, 27 May 2026 10:00:01 +0000
+DKIM-Signature: v=1; a=rsa-sha256; d=example.com; s=default; b=abc123
+X-Custom-Tracker: opaque
+Message-ID: <headers@example.com>
+Date: Wed, 27 May 2026 10:00:00 +0000
+From: Alice <alice@example.com>
+To: Bob <bob@example.com>
+Subject: Headers
+Content-Type: text/plain; charset=utf-8
+
+Body.
+"#;
+        let dto = parse_message_bytes("headers.eml", raw, RenderOptions::default()).unwrap();
+        assert!(
+            dto.headers
+                .iter()
+                .all(|header| !matches!(header.name.as_str(), "Received" | "DKIM-Signature"))
+        );
+        assert!(dto.headers.iter().any(|header| header.name == "Subject"));
+        assert_eq!(dto.headers_omitted, 3);
+
+        let all = parse_message_bytes(
+            "headers.eml",
+            raw,
+            RenderOptions {
+                headers: HeaderScope::All,
+                ..RenderOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(all.headers.iter().any(|header| header.name == "Received"));
+        assert!(
+            all.headers
+                .iter()
+                .any(|header| header.name == "X-Custom-Tracker")
+        );
+        assert_eq!(all.headers_omitted, 0);
     }
 
     #[test]

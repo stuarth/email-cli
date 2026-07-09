@@ -78,20 +78,23 @@ email-cli [FILE|-] \
   [--format json|text] \
   [--html] \
   [--max-body-bytes N] \
-  [--quotes keep|collapse|drop]
+  [--quotes keep|collapse|drop] \
+  [--headers standard|all]
 
 email-cli thread FILE... \
   [--format json|text] \
   [--html] \
   [--max-body-bytes N] \
   [--quotes keep|collapse|drop] \
+  [--headers standard|all] \
   [--subject-fallback]
 
 email-cli messages FILE... \
   [--format json|ndjson] \
   [--html] \
   [--max-body-bytes N] \
-  [--quotes keep|collapse|drop]
+  [--quotes keep|collapse|drop] \
+  [--headers standard|all]
 
 email-cli extract FILE --part <MIME_PATH_ID> [-o OUT]
 ```
@@ -118,6 +121,15 @@ Example:
 ```sh
 email-cli message.eml | jq '.message.subject, .body.text, .parts'
 ```
+
+Output is token-lean by default. Headers are limited to a standard
+identity/threading/content set, with the omitted count recorded in
+`headers_omitted`; pass `--headers all` to include everything (Received chains,
+DKIM/ARC signatures, `X-*` headers). The body alternative that produced
+`body.text` (or `body.html` with `--html`) is not repeated inside
+`body.alternatives`: its entry keeps the part metadata and hash, sets its
+content field to `null`, and marks `same_as: "body.text"`. `body.text_part_id`
+names the MIME part the body text came from.
 
 Message IDs are normalized without surrounding angle brackets. Dates are
 normalized to UTC RFC3339 in `message.date`, while the original Date header is
