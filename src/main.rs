@@ -6,9 +6,9 @@ use std::{
 use anyhow::{Result, anyhow};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use email_cli::{
-    DiagnosticDto, MessageDto, QuoteMode, RenderOptions, SCHEMA_VERSION, build_messages_envelope,
-    build_thread_envelope, extract_part_bytes, parse_message_bytes, read_file_or_stdin,
-    read_required_file, render_message_text, render_thread_text,
+    DiagnosticDto, HeaderScope, MessageDto, QuoteMode, RenderOptions, SCHEMA_VERSION,
+    build_messages_envelope, build_thread_envelope, extract_part_bytes, parse_message_bytes,
+    read_file_or_stdin, read_required_file, render_message_text, render_thread_text,
 };
 
 #[derive(Debug, Parser)]
@@ -37,6 +37,10 @@ struct Cli {
     /// Control quoted-reply rendering in text output.
     #[arg(long, value_enum, default_value_t = QuoteChoice::Keep)]
     quotes: QuoteChoice,
+
+    /// Which headers to include in JSON output.
+    #[arg(long, value_enum, default_value_t = HeaderChoice::Standard)]
+    headers: HeaderChoice,
 }
 
 #[derive(Debug, Subcommand)]
@@ -58,6 +62,9 @@ enum Command {
         #[arg(long, value_enum, default_value_t = QuoteChoice::Keep)]
         quotes: QuoteChoice,
 
+        #[arg(long, value_enum, default_value_t = HeaderChoice::Standard)]
+        headers: HeaderChoice,
+
         #[arg(long)]
         subject_fallback: bool,
     },
@@ -78,6 +85,9 @@ enum Command {
 
         #[arg(long, value_enum, default_value_t = QuoteChoice::Keep)]
         quotes: QuoteChoice,
+
+        #[arg(long, value_enum, default_value_t = HeaderChoice::Standard)]
+        headers: HeaderChoice,
     },
 
     /// Write a decoded MIME part to a file or stdout.
@@ -121,6 +131,21 @@ impl From<QuoteChoice> for QuoteMode {
     }
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum HeaderChoice {
+    Standard,
+    All,
+}
+
+impl From<HeaderChoice> for HeaderScope {
+    fn from(value: HeaderChoice) -> Self {
+        match value {
+            HeaderChoice::Standard => HeaderScope::Standard,
+            HeaderChoice::All => HeaderScope::All,
+        }
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -139,6 +164,7 @@ fn main() -> Result<()> {
             html,
             max_body_bytes,
             quotes,
+            headers,
             subject_fallback,
         }) => run_thread(
             files,
@@ -146,6 +172,7 @@ fn main() -> Result<()> {
             html,
             max_body_bytes,
             quotes,
+            headers,
             subject_fallback,
         ),
         Some(Command::Messages {
@@ -154,7 +181,8 @@ fn main() -> Result<()> {
             html,
             max_body_bytes,
             quotes,
-        }) => run_messages(files, format, html, max_body_bytes, quotes),
+            headers,
+        }) => run_messages(files, format, html, max_body_bytes, quotes, headers),
         Some(Command::Extract { file, part, output }) => run_extract(file, &part, output),
     }
 }
@@ -165,6 +193,7 @@ fn run_single(cli: Cli) -> Result<()> {
         include_html: cli.html,
         max_body_bytes: cli.max_body_bytes,
         quotes: cli.quotes.into(),
+        headers: cli.headers.into(),
     };
     let message = parse_message_bytes(path, &raw, options)?;
 
@@ -186,12 +215,14 @@ fn run_thread(
     html: bool,
     max_body_bytes: usize,
     quotes: QuoteChoice,
+    headers: HeaderChoice,
     subject_fallback: bool,
 ) -> Result<()> {
     let options = RenderOptions {
         include_html: html,
         max_body_bytes,
         quotes: quotes.into(),
+        headers: headers.into(),
     };
     let (messages, diagnostics) = parse_files_lossy(files, options);
 
@@ -219,11 +250,13 @@ fn run_messages(
     html: bool,
     max_body_bytes: usize,
     quotes: QuoteChoice,
+    headers: HeaderChoice,
 ) -> Result<()> {
     let options = RenderOptions {
         include_html: html,
         max_body_bytes,
         quotes: quotes.into(),
+        headers: headers.into(),
     };
     let (messages, diagnostics) = parse_files_lossy(files, options);
     let envelope = build_messages_envelope(messages, diagnostics);

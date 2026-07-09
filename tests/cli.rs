@@ -67,7 +67,7 @@ fn messages_json_is_schema_envelope_with_diagnostics() {
         .clone();
 
     let json: Value = serde_json::from_slice(&output).unwrap();
-    assert_eq!(json["schema_version"], "1.0");
+    assert_eq!(json["schema_version"], "1.1");
     assert_eq!(json["messages"].as_array().unwrap().len(), 1);
     assert_eq!(json["diagnostics"][0]["code"], "PARSE_FAILED");
 }
@@ -94,7 +94,7 @@ fn thread_json_continues_after_bad_file() {
         .clone();
 
     let json: Value = serde_json::from_slice(&output).unwrap();
-    assert_eq!(json["schema_version"], "1.0");
+    assert_eq!(json["schema_version"], "1.1");
     assert_eq!(json["threads"].as_array().unwrap().len(), 1);
     assert_eq!(json["diagnostics"][0]["code"], "PARSE_FAILED");
 }
